@@ -1,11 +1,15 @@
 package claude
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -42,6 +46,52 @@ func maybeMarkClaudeRefusal(c *gin.Context, stopReason string) {
 	if strings.EqualFold(stopReason, "refusal") {
 		common.SetContextKey(c, constant.ContextKeyAdminRejectReason, "claude_stop_reason=refusal")
 	}
+}
+
+func buildClaudeFileContent(file *dto.MessageFile) (*dto.ClaudeMediaMessage, error) {
+	if file == nil || file.FileData == "" {
+		return nil, nil
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(file.FileData)
+	if err != nil {
+		return nil, fmt.Errorf("decode file data failed: %w", err)
+	}
+
+	ext := strings.ToLower(filepath.Ext(file.FileName))
+	switch ext {
+	case ".pdf":
+		return &dto.ClaudeMediaMessage{
+			Type: "document",
+			Source: &dto.ClaudeMessageSource{
+				Type:      "base64",
+				MediaType: "application/pdf",
+				Data:      file.FileData,
+			},
+		}, nil
+	case ".txt", ".md", ".markdown", ".csv", ".json", ".xml", ".yaml", ".yml", ".log":
+		if !utf8.Valid(decoded) {
+			return nil, nil
+		}
+		text := string(decoded)
+		return &dto.ClaudeMediaMessage{
+			Type: "text",
+			Text: common.GetPointer(text),
+		}, nil
+	}
+
+	if detected := mime.TypeByExtension(ext); strings.HasPrefix(detected, "text/") {
+		if !utf8.Valid(decoded) {
+			return nil, nil
+		}
+		text := string(decoded)
+		return &dto.ClaudeMediaMessage{
+			Type: "text",
+			Text: common.GetPointer(text),
+		}, nil
+	}
+
+	return nil, nil
 }
 
 func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRequest) (*dto.ClaudeRequest, error) {
@@ -349,6 +399,14 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 							Type: "text",
 							Text: common.GetPointer[string](mediaMessage.Text),
 						})
+					case dto.ContentTypeFile:
+						claudeFileMessage, err := buildClaudeFileContent(mediaMessage.GetFile())
+						if err != nil {
+							return nil, err
+						}
+						if claudeFileMessage != nil {
+							claudeMediaMessages = append(claudeMediaMessages, *claudeFileMessage)
+						}
 					default:
 						source := mediaMessage.ToFileSource()
 						if source == nil {
@@ -404,6 +462,7 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 
 	claudeRequest.Prompt = ""
 	claudeRequest.Messages = claudeMessages
+
 	return &claudeRequest, nil
 }
 
@@ -801,11 +860,19 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 	return nil
 }
 
-func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo) {
+func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo) *types.NewAPIError {
 	if claudeInfo.Usage.PromptTokens == 0 {
 		//上游出错
 	}
 	if claudeInfo.Usage.CompletionTokens == 0 || !claudeInfo.Done {
+		if claudeInfo.ResponseText.Len() == 0 {
+			// Streaming started (got message_start with prompt tokens) but no content received.
+			// This is an upstream timeout/disconnect — do NOT bill the user.
+			return types.NewError(
+				fmt.Errorf("upstream stream interrupted: received prompt tokens but no completion output"),
+				types.ErrorCodeDoRequestFailed,
+			)
+		}
 		if common.DebugEnabled {
 			common.SysLog("claude response usage is not complete, maybe upstream error")
 		}
@@ -837,6 +904,7 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 		}
 		helper.Done(c)
 	}
+	return nil
 }
 
 func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
@@ -858,7 +926,9 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 		return nil, err
 	}
 
-	HandleStreamFinalResponse(c, info, claudeInfo)
+	if streamErr := HandleStreamFinalResponse(c, info, claudeInfo); streamErr != nil {
+		return nil, streamErr
+	}
 	return claudeInfo.Usage, nil
 }
 

@@ -64,6 +64,14 @@ func GetRequestBody(c *gin.Context) (io.Seeker, error) {
 	maxBytes := int64(maxMB) << 20
 
 	contentLength := c.Request.ContentLength
+	if c.Request.Body == nil {
+		storage, err := CreateBodyStorage(nil)
+		if err != nil {
+			return nil, err
+		}
+		c.Set(KeyBodyStorage, storage)
+		return storage, nil
+	}
 
 	// 使用新的存储系统
 	storage, err := CreateBodyStorageFromReader(c.Request.Body, contentLength, maxBytes)

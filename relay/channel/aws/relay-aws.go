@@ -289,7 +289,9 @@ func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (
 		}
 	}
 
-	claude.HandleStreamFinalResponse(c, info, claudeInfo)
+	if streamErr := claude.HandleStreamFinalResponse(c, info, claudeInfo); streamErr != nil {
+		return streamErr, nil
+	}
 	return nil, claudeInfo.Usage
 }
 

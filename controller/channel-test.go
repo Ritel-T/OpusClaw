@@ -150,13 +150,19 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 		}
 	}
 	cache.WriteContext(c)
+	common.SetContextKey(c, constant.ContextKeyUserId, cache.Id)
 
 	//c.Request.Header.Set("Authorization", "Bearer "+channel.Key)
 	c.Request.Header.Set("Content-Type", "application/json")
 	c.Set("channel", channel.Type)
 	c.Set("base_url", channel.GetBaseURL())
 	group, _ := model.GetUserGroup(1, false)
+	if strings.TrimSpace(group) == "" {
+		group = "default"
+	}
 	c.Set("group", group)
+	common.SetContextKey(c, constant.ContextKeyUserGroup, group)
+	common.SetContextKey(c, constant.ContextKeyUsingGroup, group)
 
 	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, testModel)
 	if newAPIError != nil {
