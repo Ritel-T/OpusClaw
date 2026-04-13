@@ -1,6 +1,6 @@
 # AGENTS.md — Project Conventions for new-api
 
-> **最后更新**：2026-04-09（converge-to-official：移除计费表达式引擎、ops 工具链迁移至独立仓库）
+> **最后更新**：2026-04-13（Gemini 兼容修复、测试实例部署验证、upstream merge 收口）
 
 ## Overview
 
@@ -140,7 +140,31 @@ The standard flow remains:
 | 数据 | `/srv/opusclaw-test/data/` |
 | 镜像 | 与生产共用 `opusclaw/new-api:local` |
 
-用途：在部署到生产前，先在本机测试实例上验证新镜像行为。测试实例使用独立数据目录，不影响生产。可通过 `docker rm -f opusclaw-test-app && docker run ...` 快速重建。
+用途：在部署到生产前，先在本机测试实例上验证新镜像行为。测试实例使用独立数据目录，不影响生产。
+
+**推荐的测试实例验证流程**：
+
+```bash
+# 1. 在 oc-dev 构建最新镜像（更新 opusclaw/new-api:local）
+cd /root/src/opusclaw-ops
+./deploy-opusclaw.sh build
+
+# 2. 如 compose 无法替换旧容器，先仅删除测试 app 容器（不要动 redis/data）
+docker rm -f opusclaw-test-app
+
+# 3. 使用测试 compose 重建 app
+cd /srv/opusclaw-test
+docker compose up -d app
+
+# 4. 验证测试实例
+wget -q -O - http://127.0.0.1:13000/api/status
+docker logs opusclaw-test-app --tail 50
+```
+
+**注意**：
+- 只重建 `opusclaw-test-app`，不要删除 `/srv/opusclaw-test/data/`。
+- `opusclaw-test-app` 使用和生产相同的 `opusclaw/new-api:local` 标签，因此**测试实例验证通过后**再执行正式 `push`。
+- 如果健康检查在 60s 窗口内失败，不代表部署一定失败——先看容器状态、日志和 `/api/status`，尤其留意 Redis 启动时的 `LOADING` 窗口。
 
 **Incident reference**: On 2026-04-04, a stale source code snapshot on oc-gateway (`/srv/opusclaw/app-src/`) was used to rebuild the container. That snapshot predated the local tiered-billing fork (since removed from this repo during the converge-to-official cleanup), so tiered billing silently fell back to legacy ratio billing for all affected models. The stale directory has been renamed to `app-src.deprecated-20260404`. The root cause — keeping any source tree on the gateway — is eliminated by the current image-only deployment model.
 
@@ -199,6 +223,43 @@ Use `bun` as the preferred package manager and script runner for the frontend (`
 When implementing a new channel:
 - Confirm whether the provider supports `StreamOptions`.
 - If supported, add the channel to `streamSupportedChannels`.
+
+### Rule 7: Gemini / Vertex Compatibility — Treat Schema and Tool Conversion as High Risk
+
+Gemini-compatible relay paths are **not** tolerant of loose OpenAI schema/tool assumptions. Small conversion mistakes often surface as upstream `400 invalid request format` errors.
+
+**Critical request conversion rules:**
+
+- In `service/convert.go`, Gemini `functionCall` / `functionResponse` pairs MUST preserve a stable OpenAI `tool_call_id` mapping. Do not regenerate tool response IDs independently.
+- In `service/openaicompat/chat_to_responses.go`, `function_call_output` items MUST include `name` as well as `call_id` and `output`.
+- Gemini `fileData` / `inlineData` MUST NOT be blindly converted to OpenAI `image_url`.
+  - `image/*` → `image_url`
+  - `audio/*` → `input_audio`
+  - `video/*` → `video_url`
+  - non-image files (e.g. PDF/text) → safe text/file representation, not fake image payloads
+
+**Critical Gemini function schema rules:**
+
+- In `relay/channel/gemini/relay-gemini.go`, function parameter schemas must be normalized before forwarding.
+- Preserve standard JSON Schema lowercase primitive type values in the cleaned schema (`object`, `array`, `string`, `integer`, `number`, `boolean`) unless a future upstream/API contract is verified otherwise end-to-end.
+- If a schema node omits `type`, infer conservatively:
+  - has `properties` → `object`
+  - has `items` → `array`
+  - has `enum` only → `string`
+- Strip or whitelist unsupported schema fields carefully. `propertyNames` is known-bad for Gemini function declarations.
+- Treat `anyOf` / `oneOf` / `allOf` as compatibility hazards. Verify the exact upstream path before preserving them.
+
+**Known error signatures this rule is meant to prevent:**
+
+- `No tool call found for function call output with call_id ...`
+- `Missing required parameter: 'input[...].name'`
+- `Invalid schema for function '...': 'STRING' is not valid ...`
+- `schema didn't specify the schema type field`
+
+**Required regression tests when touching these paths:**
+
+- `go test ./service ./service/openaicompat -run 'TestGeminiToOpenAIRequest|TestChatCompletionsRequestToResponsesRequest' -count=1`
+- `go test ./relay/channel/gemini -run 'TestGemini|TestCleanFunctionParameters' -count=1`
 
 ### Rule 5: Protected Project Information — DO NOT Modify or Delete
 
@@ -271,6 +332,10 @@ We maintain a custom fix that prevents billing users when an upstream stream is 
 **Why upstream doesn't cover the billing guard:**
 - Upstream added `StreamStatus` (in `relay/common/stream_status.go`) which records *why* a stream ended (timeout, client_gone, etc.) into logs. However, `StreamStatus` is **observation-only** — it does not influence the billing path. `PostTextConsumeQuota` is still called unconditionally after `HandleStreamFinalResponse`.
 
+**StreamStatus merge note:**
+- In `relay/helper/stream_scanner.go`, do **not** unconditionally replace an existing `info.StreamStatus` during merge/refactor work.
+- Only initialize `StreamStatus` when it is `nil`; otherwise preserve pre-recorded errors/end-state context. This is covered by `TestStreamScannerHandler_StreamStatus_PreInitialized`.
+
 **During upstream merges:**
 - If `HandleStreamFinalResponse` signature or billing flow changes upstream, manually verify our guard logic is preserved.
 - Key files to watch: `relay/channel/claude/relay-claude.go`, `relay/channel/aws/relay-aws.go`, `common/body_storage.go`, `common/gin.go`, `controller/channel-test.go`, `service/quota.go`.
@@ -280,9 +345,14 @@ We maintain a custom fix that prevents billing users when an upstream stream is 
 **所有代码修改必须及时 commit，禁止执行会丢失未提交代码的 git 操作。**
 
 **及时 Commit 规则：**
-- 每完成一个逻辑单元的修改（编辑 + 测试通过 + 诊断通过），**立即 commit**，不等用户要求
+- 每完成一个逻辑单元的修改（编辑 + 测试通过 + 诊断通过），**立即 commit**
 - Commit 是免费的安全网——可以 amend、squash、revert，但未提交的工作区变更丢了就无法恢复
 - 未提交的修改不受 `git reflog` 保护
+
+**推荐的提交粒度：**
+- Gemini / Responses / schema 修复要按逻辑单元拆分 commit（例如“转换契约修复”和“schema 修复”分开）
+- 在开始 upstream merge 前，先把本地 bugfix 以独立 commit 落下，作为 merge 锚点
+- merge 完成后，如果为适配上游引入额外回归修复，可并入 merge 提交或紧跟单独 commit，但必须重新跑相关测试
 
 **绝对禁止的 git 操作（无例外）：**
 - `git checkout -- <file>` 或 `git checkout .`（还原工作区文件）
