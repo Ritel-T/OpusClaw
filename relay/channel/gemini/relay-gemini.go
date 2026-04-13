@@ -822,23 +822,35 @@ func cleanFunctionParametersShallow(params interface{}) interface{} {
 func normalizeGeminiSchemaTypeAndNullable(schema map[string]interface{}) {
 	rawType, ok := schema["type"]
 	if !ok || rawType == nil {
+		if _, hasProperties := schema["properties"]; hasProperties {
+			schema["type"] = "object"
+			return
+		}
+		if _, hasItems := schema["items"]; hasItems {
+			schema["type"] = "array"
+			return
+		}
+		if _, hasEnum := schema["enum"]; hasEnum {
+			schema["type"] = "string"
+			return
+		}
 		return
 	}
 
 	normalize := func(t string) (string, bool) {
 		switch strings.ToLower(strings.TrimSpace(t)) {
 		case "object":
-			return "OBJECT", false
+			return "object", false
 		case "array":
-			return "ARRAY", false
+			return "array", false
 		case "string":
-			return "STRING", false
+			return "string", false
 		case "integer":
-			return "INTEGER", false
+			return "integer", false
 		case "number":
-			return "NUMBER", false
+			return "number", false
 		case "boolean":
-			return "BOOLEAN", false
+			return "boolean", false
 		case "null":
 			return "", true
 		default:
