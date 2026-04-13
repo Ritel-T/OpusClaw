@@ -702,6 +702,7 @@ func getSupportedMimeTypesList() []string {
 
 var geminiOpenAPISchemaAllowedFields = map[string]struct{}{
 	"anyOf":            {},
+	"allOf":            {},
 	"default":          {},
 	"description":      {},
 	"enum":             {},
@@ -721,6 +722,7 @@ var geminiOpenAPISchemaAllowedFields = map[string]struct{}{
 	"properties":       {},
 	"propertyOrdering": {},
 	"required":         {},
+	"oneOf":            {},
 	"title":            {},
 	"type":             {},
 }
@@ -751,6 +753,7 @@ func cleanFunctionParametersWithDepth(params interface{}, depth int) interface{}
 			}
 		}
 
+		collapseGeminiSchemaCombinators(cleanedMap)
 		normalizeGeminiSchemaTypeAndNullable(cleanedMap)
 
 		// Clean properties
@@ -769,15 +772,6 @@ func cleanFunctionParametersWithDepth(params interface{}, depth int) interface{}
 		// OpenAPI tuple-style items is not supported by Gemini SDK Schema; keep first to avoid API rejection.
 		if itemsArray, ok := cleanedMap["items"].([]interface{}); ok && len(itemsArray) > 0 {
 			cleanedMap["items"] = cleanFunctionParametersWithDepth(itemsArray[0], depth+1)
-		}
-
-		// Recursively clean anyOf
-		if nested, ok := cleanedMap["anyOf"].([]interface{}); ok && nested != nil {
-			cleanedNested := make([]interface{}, len(nested))
-			for i, item := range nested {
-				cleanedNested[i] = cleanFunctionParametersWithDepth(item, depth+1)
-			}
-			cleanedMap["anyOf"] = cleanedNested
 		}
 
 		return cleanedMap
@@ -805,11 +799,14 @@ func cleanFunctionParametersShallow(params interface{}) interface{} {
 				cleanedMap[k] = val
 			}
 		}
+		collapseGeminiSchemaCombinators(cleanedMap)
 		normalizeGeminiSchemaTypeAndNullable(cleanedMap)
 		// Stop recursion and avoid retaining huge nested structures.
 		delete(cleanedMap, "properties")
 		delete(cleanedMap, "items")
 		delete(cleanedMap, "anyOf")
+		delete(cleanedMap, "oneOf")
+		delete(cleanedMap, "allOf")
 		return cleanedMap
 	case []interface{}:
 		// Prefer an empty list over deep recursion on attacker-controlled inputs.
@@ -890,6 +887,114 @@ func normalizeGeminiSchemaTypeAndNullable(schema map[string]interface{}) {
 		} else {
 			delete(schema, "type")
 		}
+	}
+}
+
+func collapseGeminiSchemaCombinators(schema map[string]interface{}) {
+	if schema == nil {
+		return
+	}
+	if _, hasType := schema["type"]; !hasType {
+		if inferredType, nullable := inferTypeFromGeminiSchemaCombinators(schema); inferredType != "" {
+			schema["type"] = inferredType
+			if nullable {
+				schema["nullable"] = true
+			}
+		}
+	}
+	delete(schema, "anyOf")
+	delete(schema, "oneOf")
+	delete(schema, "allOf")
+}
+
+func inferTypeFromGeminiSchemaCombinators(schema map[string]interface{}) (string, bool) {
+	for _, field := range []string{"anyOf", "oneOf", "allOf"} {
+		raw, ok := schema[field]
+		if !ok {
+			continue
+		}
+		variants, ok := raw.([]interface{})
+		if !ok || len(variants) == 0 {
+			continue
+		}
+		nullable := false
+		chosen := ""
+		for _, variant := range variants {
+			variantMap, ok := variant.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			variantType, variantNullable := inferGeminiSchemaType(variantMap)
+			if variantNullable {
+				nullable = true
+			}
+			if variantType != "" {
+				if chosen == "" {
+					chosen = variantType
+				}
+			}
+		}
+		return chosen, nullable
+	}
+	return "", false
+}
+
+func inferGeminiSchemaType(schema map[string]interface{}) (string, bool) {
+	if schema == nil {
+		return "", false
+	}
+	if rawType, ok := schema["type"]; ok && rawType != nil {
+		switch t := rawType.(type) {
+		case string:
+			normalized, isNull := normalizeGeminiSchemaPrimitiveType(t)
+			return normalized, isNull
+		case []interface{}:
+			nullable := false
+			for _, item := range t {
+				if s, ok := item.(string); ok {
+					normalized, isNull := normalizeGeminiSchemaPrimitiveType(s)
+					if isNull {
+						nullable = true
+						continue
+					}
+					if normalized != "" {
+						return normalized, nullable
+					}
+				}
+			}
+			return "", nullable
+		}
+	}
+	if _, hasProperties := schema["properties"]; hasProperties {
+		return "object", false
+	}
+	if _, hasItems := schema["items"]; hasItems {
+		return "array", false
+	}
+	if _, hasEnum := schema["enum"]; hasEnum {
+		return "string", false
+	}
+	return inferTypeFromGeminiSchemaCombinators(schema)
+}
+
+func normalizeGeminiSchemaPrimitiveType(t string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(t)) {
+	case "object":
+		return "object", false
+	case "array":
+		return "array", false
+	case "string":
+		return "string", false
+	case "integer":
+		return "integer", false
+	case "number":
+		return "number", false
+	case "boolean":
+		return "boolean", false
+	case "null":
+		return "", true
+	default:
+		return t, false
 	}
 }
 

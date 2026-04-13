@@ -78,3 +78,39 @@ func TestCleanFunctionParametersInfersMissingTypes(t *testing.T) {
 	require.Equal(t, "string", items["type"])
 	require.Equal(t, []any{"before", "after"}, items["enum"])
 }
+
+func TestCleanFunctionParametersCollapsesAnyOfToStableType(t *testing.T) {
+	t.Parallel()
+
+	params := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"path": map[string]any{
+				"anyOf": []any{
+					map[string]any{"type": "string"},
+					map[string]any{"type": "null"},
+				},
+			},
+			"count": map[string]any{
+				"oneOf": []any{
+					map[string]any{"type": "integer"},
+					map[string]any{"type": "number"},
+				},
+			},
+		},
+	}
+
+	cleaned := cleanFunctionParameters(params).(map[string]any)
+	properties := cleaned["properties"].(map[string]any)
+
+	pathSchema := properties["path"].(map[string]any)
+	require.Equal(t, "string", pathSchema["type"])
+	require.Equal(t, true, pathSchema["nullable"])
+	_, hasAnyOf := pathSchema["anyOf"]
+	require.False(t, hasAnyOf)
+
+	countSchema := properties["count"].(map[string]any)
+	require.Equal(t, "integer", countSchema["type"])
+	_, hasOneOf := countSchema["oneOf"]
+	require.False(t, hasOneOf)
+}
