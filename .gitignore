@@ -31,4 +31,5 @@ data/
 .gopath
 .test
 token_estimator_test.go
-skills-lock.json.sisyphus/
+skills-lock.json
+.sisyphus/
