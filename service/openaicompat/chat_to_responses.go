@@ -86,6 +86,7 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 
 	var instructionsParts []string
 	inputItems := make([]map[string]any, 0, len(req.Messages))
+	toolCallNamesByID := make(map[string]string)
 
 	for _, msg := range req.Messages {
 		role := strings.TrimSpace(msg.Role)
@@ -95,6 +96,13 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 
 		if role == "tool" || role == "function" {
 			callID := strings.TrimSpace(msg.ToolCallId)
+			name := ""
+			if msg.Name != nil {
+				name = strings.TrimSpace(*msg.Name)
+			}
+			if name == "" && callID != "" {
+				name = strings.TrimSpace(toolCallNamesByID[callID])
+			}
 
 			var output any
 			if msg.Content == nil {
@@ -120,6 +128,7 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 			inputItems = append(inputItems, map[string]any{
 				"type":    "function_call_output",
 				"call_id": callID,
+				"name":    name,
 				"output":  output,
 			})
 			continue
@@ -172,6 +181,7 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 					if name == "" {
 						continue
 					}
+					toolCallNamesByID[tc.ID] = name
 					inputItems = append(inputItems, map[string]any{
 						"type":      "function_call",
 						"call_id":   tc.ID,
@@ -199,6 +209,7 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 					if name == "" {
 						continue
 					}
+					toolCallNamesByID[tc.ID] = name
 					inputItems = append(inputItems, map[string]any{
 						"type":      "function_call",
 						"call_id":   tc.ID,
@@ -264,6 +275,7 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 				if name == "" {
 					continue
 				}
+				toolCallNamesByID[tc.ID] = name
 				inputItems = append(inputItems, map[string]any{
 					"type":      "function_call",
 					"call_id":   tc.ID,

@@ -663,6 +663,8 @@ func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycomm
 
 	// 转换 messages
 	var messages []dto.Message
+	toolCallCounter := 0
+	pendingToolCallIDsByName := make(map[string][]string)
 	for _, content := range geminiRequest.Contents {
 		message := dto.Message{
 			Role: convertGeminiRoleToOpenAI(content.Role),
@@ -679,29 +681,15 @@ func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycomm
 				}
 				mediaContents = append(mediaContents, mediaContent)
 			} else if part.InlineData != nil {
-				mediaContent := dto.MediaContent{
-					Type: "image_url",
-					ImageUrl: &dto.MessageImageUrl{
-						Url:      fmt.Sprintf("data:%s;base64,%s", part.InlineData.MimeType, part.InlineData.Data),
-						Detail:   "auto",
-						MimeType: part.InlineData.MimeType,
-					},
-				}
-				mediaContents = append(mediaContents, mediaContent)
+				mediaContents = append(mediaContents, convertGeminiInlineDataToOpenAIMedia(part.InlineData))
 			} else if part.FileData != nil {
-				mediaContent := dto.MediaContent{
-					Type: "image_url",
-					ImageUrl: &dto.MessageImageUrl{
-						Url:      part.FileData.FileUri,
-						Detail:   "auto",
-						MimeType: part.FileData.MimeType,
-					},
-				}
-				mediaContents = append(mediaContents, mediaContent)
+				mediaContents = append(mediaContents, convertGeminiFileDataToOpenAIMedia(part.FileData))
 			} else if part.FunctionCall != nil {
 				// 处理 Gemini 的工具调用
+				toolCallCounter++
+				toolCallID := fmt.Sprintf("call_%d", toolCallCounter)
 				toolCall := dto.ToolCallRequest{
-					ID:   fmt.Sprintf("call_%d", len(toolCalls)+1), // 生成唯一ID
+					ID:   toolCallID,
 					Type: "function",
 					Function: dto.FunctionRequest{
 						Name:      part.FunctionCall.FunctionName,
@@ -709,14 +697,23 @@ func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycomm
 					},
 				}
 				toolCalls = append(toolCalls, toolCall)
+				pendingToolCallIDsByName[part.FunctionCall.FunctionName] = append(pendingToolCallIDsByName[part.FunctionCall.FunctionName], toolCallID)
 			} else if part.FunctionResponse != nil {
-				// 处理 Gemini 的工具响应，创建单独的 tool 消息
-				toolMessage := dto.Message{
-					Role:       "tool",
-					ToolCallId: fmt.Sprintf("call_%d", len(toolCalls)), // 使用对应的调用ID
+				toolCallID, ok := popPendingToolCallIDByName(pendingToolCallIDsByName, part.FunctionResponse.Name)
+				if ok {
+					// 处理 Gemini 的工具响应，创建单独的 tool 消息
+					toolMessage := dto.Message{
+						Role:       "tool",
+						ToolCallId: toolCallID,
+					}
+					toolMessage.SetStringContent(toJSONString(part.FunctionResponse.Response))
+					messages = append(messages, toolMessage)
+				} else {
+					mediaContents = append(mediaContents, dto.MediaContent{
+						Type: "text",
+						Text: formatGeminiFunctionResponseAsText(part.FunctionResponse),
+					})
 				}
-				toolMessage.SetStringContent(toJSONString(part.FunctionResponse.Response))
-				messages = append(messages, toolMessage)
 			}
 		}
 
@@ -808,9 +805,114 @@ func convertGeminiRoleToOpenAI(geminiRole string) string {
 	case "model":
 		return "assistant"
 	case "function":
-		return "function"
+		return "user"
 	default:
 		return "user"
+	}
+}
+
+func popPendingToolCallIDByName(pending map[string][]string, name string) (string, bool) {
+	if len(pending) == 0 || name == "" {
+		return "", false
+	}
+	ids := pending[name]
+	if len(ids) == 0 {
+		return "", false
+	}
+	toolCallID := ids[0]
+	if len(ids) == 1 {
+		delete(pending, name)
+	} else {
+		pending[name] = ids[1:]
+	}
+	return toolCallID, true
+}
+
+func convertGeminiInlineDataToOpenAIMedia(inlineData *dto.GeminiInlineData) dto.MediaContent {
+	dataURL := fmt.Sprintf("data:%s;base64,%s", inlineData.MimeType, inlineData.Data)
+	switch {
+	case strings.HasPrefix(inlineData.MimeType, "image/"):
+		return dto.MediaContent{
+			Type: dto.ContentTypeImageURL,
+			ImageUrl: &dto.MessageImageUrl{
+				Url:      dataURL,
+				Detail:   "auto",
+				MimeType: inlineData.MimeType,
+			},
+		}
+	case strings.HasPrefix(inlineData.MimeType, "audio/"):
+		return dto.MediaContent{
+			Type: dto.ContentTypeInputAudio,
+			InputAudio: &dto.MessageInputAudio{
+				Data:   inlineData.Data,
+				Format: strings.TrimPrefix(inlineData.MimeType, "audio/"),
+			},
+		}
+	case strings.HasPrefix(inlineData.MimeType, "video/"):
+		return dto.MediaContent{
+			Type: dto.ContentTypeVideoUrl,
+			VideoUrl: &dto.MessageVideoUrl{
+				Url: dataURL,
+			},
+		}
+	default:
+		return dto.MediaContent{
+			Type: dto.ContentTypeFile,
+			File: &dto.MessageFile{
+				FileData: inlineData.Data,
+			},
+		}
+	}
+}
+
+func convertGeminiFileDataToOpenAIMedia(fileData *dto.GeminiFileData) dto.MediaContent {
+	uri := strings.TrimSpace(fileData.FileUri)
+	switch {
+	case strings.HasPrefix(fileData.MimeType, "image/"):
+		return dto.MediaContent{
+			Type: dto.ContentTypeImageURL,
+			ImageUrl: &dto.MessageImageUrl{
+				Url:      uri,
+				Detail:   "auto",
+				MimeType: fileData.MimeType,
+			},
+		}
+	case strings.HasPrefix(fileData.MimeType, "video/"):
+		return dto.MediaContent{
+			Type: dto.ContentTypeVideoUrl,
+			VideoUrl: &dto.MessageVideoUrl{
+				Url: uri,
+			},
+		}
+	default:
+		return dto.MediaContent{
+			Type: dto.ContentTypeText,
+			Text: formatGeminiFileReferenceAsText(fileData),
+		}
+	}
+}
+
+func formatGeminiFunctionResponseAsText(functionResponse *dto.GeminiFunctionResponse) string {
+	name := strings.TrimSpace(functionResponse.Name)
+	responseText := toJSONString(functionResponse.Response)
+	if name == "" {
+		return responseText
+	}
+	return fmt.Sprintf("[tool_response %s] %s", name, responseText)
+}
+
+func formatGeminiFileReferenceAsText(fileData *dto.GeminiFileData) string {
+	uri := strings.TrimSpace(fileData.FileUri)
+	mimeType := strings.TrimSpace(fileData.MimeType)
+	switch {
+	case mimeType != "" && uri != "":
+		return fmt.Sprintf("[file %s] %s", mimeType, uri)
+	case uri != "":
+		return fmt.Sprintf("[file] %s", uri)
+	case mimeType != "":
+		return fmt.Sprintf("[file %s]", mimeType)
+	default:
+		return "[file]"
 	}
 }
 
