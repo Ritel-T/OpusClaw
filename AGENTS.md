@@ -80,29 +80,31 @@ bun run build
 
 ## Deployment
 
-**所有源码统一在 oc-dev 上开发，oc-gateway 仅有 Docker 镜像 + compose + 数据卷，不保留源码。**
+**主机命名与运行角色可能正在迁移。不要仅根据文档里的机器名做操作，必须先用 `hostnamectl`、`tailscale status`、`/root/src/opusclaw-ops/deploy-opusclaw.sh status` 核验当前 build host、runtime host、测试实例和生产实例。**
 
 | Machine | Tailscale | Role | Source Code |
 |---------|-----------|------|-------------|
-| oc-dev | 100.114.232.111 | Build & develop | `/root/src/opusclaw/` (git repo, `main` branch) |
-| oc-gateway | 100.88.210.12 | Production runtime | `/srv/opusclaw/deploy/` (compose + data only, **NO source code**) |
+| oc-dev | `100.114.232.111` | **Currently verified build host in this repo session** | `/root/src/opusclaw/` + `/root/src/opusclaw-ops/` |
+| oc-gateway | `100.88.210.12` | **Currently verified production runtime in this repo session** | `/srv/opusclaw/deploy/` (image-only, no source code) |
+| ccs-8450-xeon | `100.119.185.127` | Present in Tailscale; migration target / alternate host | Verify role before using |
 
 **构建与部署**
 
 Deploy scripts (`deploy-opusclaw.sh`, docker-compose configs, CI workflows) have been **moved out of this repo** into the standalone ops repo at `/root/src/opusclaw-ops/`. Refer to that repo for build/push/rollback commands. The deployment topology and image naming below is informational only.
 
 The standard flow remains:
-1. Build image on oc-dev (tagged `oc-<git-short-hash>` + `local` alias)
-2. Transfer via `docker save | gzip | ssh oc-gateway gunzip | docker load`
-3. Remote `docker tag` + `docker compose up -d app` rebuild
+1. On the **verified current build host**, build image (tagged `oc-<git-short-hash>` + `local` alias)
+2. If build host and runtime host are separated, transfer/load the image to the **verified current runtime host**
+3. Refresh the `local` alias and recreate the app container via compose
 4. Health-check via `GET /api/status`
+5. Before any production action, confirm the actual target machine again via `deploy-opusclaw.sh status`
 
 **旧 deploy script 引用（保留仅作参考）：**
 
 ```bash
 # These commands live in /root/src/opusclaw-ops/ — not in this repo
 ./deploy-opusclaw.sh build          # 构建（自动以 git commit hash 打不可变标签）
-./deploy-opusclaw.sh push           # 推送到 oc-gateway 并重建容器 + 健康检查
+./deploy-opusclaw.sh push           # 推送到当前核验后的生产运行主机并重建容器 + 健康检查
 ./deploy-opusclaw.sh deploy         # build + push 一步完成（默认行为）
 ./deploy-opusclaw.sh status         # 查看本地和远端镜像/容器状态
 ./deploy-opusclaw.sh rollback <tag> # 回滚到指定镜像标签
@@ -111,15 +113,15 @@ The standard flow remains:
 **镜像标签策略**：每次 build 生成 `opusclaw/new-api:oc-<git-short-hash>`（不可变），同时更新别名 `opusclaw/new-api:local`（compose 统一引用此标签）。旧的不可变标签保留在两端，可随时 rollback。
 
 **部署流程**：
-1. `docker build` on oc-dev from `/root/src/opusclaw/`，打 `oc-<hash>` 不可变标签 + `local` 别名
-2. `docker save | gzip | ssh oc-gateway gunzip | docker load` 压缩传输（约减少 50% 传输量）
-3. 远端 `docker tag` 建立 `local` 别名 + `docker compose up -d app` 重建容器
+1. `docker build` on the verified build host from `/root/src/opusclaw/`，打 `oc-<hash>` 不可变标签 + `local` 别名
+2. If build/deploy hosts are separated, `docker save | gzip | ssh <runtime-host> gunzip | docker load` 传输镜像
+3. On the verified runtime host, `docker tag` 建立 `local` 别名 + `docker compose up -d app` 重建容器
 4. 自动等待并通过 `/api/status` 端点验证健康状态
 5. 旧镜像以不可变标签保留，随时可 `rollback`
 
 **健康检查端点**：`GET /api/status` — 返回包含 `success` 的 JSON 表示服务正常。compose 中的 healthcheck 也使用此端点。
 
-**oc-gateway directory structure**:
+**runtime host directory structure**:
 ```
 /srv/opusclaw/deploy/
 ├── docker-compose.yml   ← image-only, NO build context
@@ -128,9 +130,9 @@ The standard flow remains:
 └── redis/               ← Redis AOF (persistent)
 ```
 
-**CRITICAL**: Never put source code on oc-gateway. Never use `docker compose build` on oc-gateway. The compose file has no `build:` section — it only references `image: opusclaw/new-api:local`.
+**CRITICAL**: Never put source code on the runtime-only host. Never use `docker compose build` on the runtime-only host. The compose file has no `build:` section — it only references `image: opusclaw/new-api:local`.
 
-**本机测试实例**（oc-dev 上的隔离验证环境）：
+**本机测试实例**（当前 build host 上的隔离验证环境；本次核验中位于 `oc-dev`）：
 
 | 项目 | 值 |
 |------|------|
@@ -145,7 +147,7 @@ The standard flow remains:
 **推荐的测试实例验证流程**：
 
 ```bash
-# 1. 在 oc-dev 构建最新镜像（更新 opusclaw/new-api:local）
+# 1. 在当前核验后的构建机构建最新镜像（更新 opusclaw/new-api:local）
 cd /root/src/opusclaw-ops
 ./deploy-opusclaw.sh build
 
@@ -166,7 +168,13 @@ docker logs opusclaw-test-app --tail 50
 - `opusclaw-test-app` 使用和生产相同的 `opusclaw/new-api:local` 标签，因此**测试实例验证通过后**再执行正式 `push`。
 - 如果健康检查在 60s 窗口内失败，不代表部署一定失败——先看容器状态、日志和 `/api/status`，尤其留意 Redis 启动时的 `LOADING` 窗口。
 
-**Incident reference**: On 2026-04-04, a stale source code snapshot on oc-gateway (`/srv/opusclaw/app-src/`) was used to rebuild the container. That snapshot predated the local tiered-billing fork (since removed from this repo during the converge-to-official cleanup), so tiered billing silently fell back to legacy ratio billing for all affected models. The stale directory has been renamed to `app-src.deprecated-20260404`. The root cause — keeping any source tree on the gateway — is eliminated by the current image-only deployment model.
+**Fact snapshot from this session (2026-04-14 UTC):**
+- local machine `hostnamectl` reported `oc-dev`
+- `tailscale status` showed `ccs-8450-xeon` online at `100.119.185.127`
+- `/root/src/opusclaw-ops/deploy-opusclaw.sh status` showed local test instance on this machine and production app running on `oc-gateway`
+- therefore, doc changes must not blindly replace all `oc-dev / oc-gateway` references with `ccs-8450-xeon`; verify first, then act
+
+**Incident reference**: On 2026-04-04, a stale source code snapshot on the old runtime host (`/srv/opusclaw/app-src/`, on `oc-gateway`) was used to rebuild the container. That snapshot predated the local tiered-billing fork (since removed from this repo during the converge-to-official cleanup), so tiered billing silently fell back to legacy ratio billing for all affected models. The stale directory was renamed to `app-src.deprecated-20260404`. The root cause — keeping any source tree on the runtime host — remains forbidden under the current image-only deployment model.
 
 ## Rules
 
