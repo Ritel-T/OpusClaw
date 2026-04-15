@@ -80,13 +80,13 @@ bun run build
 
 ## Deployment
 
-**主机命名与运行角色可能正在迁移。不要仅根据文档里的机器名做操作，必须先用 `hostnamectl`、`tailscale status`、`/root/src/opusclaw-ops/deploy-opusclaw.sh status` 核验当前 build host、runtime host、测试实例和生产实例。**
+**当前部署状态存在“公网实际运行”与“本地 ops/SSH 认知”可能短暂不一致的情况。必须同时核验：`hostnamectl`、`tailscale status`、`/root/src/opusclaw-ops/deploy-opusclaw.sh status`、以及 `https://opusclaw.me/api/status`。不要仅根据旧主机名、旧脚本默认值或单一探测结果做判断。**
 
 | Machine | Tailscale | Role | Source Code |
 |---------|-----------|------|-------------|
-| oc-dev | `100.114.232.111` | **Currently verified build host in this repo session** | `/root/src/opusclaw/` + `/root/src/opusclaw-ops/` |
-| oc-gateway | `100.88.210.12` | **Currently verified production runtime in this repo session** | `/srv/opusclaw/deploy/` (image-only, no source code) |
-| ccs-8450-xeon | `100.119.185.127` | Present in Tailscale; migration target / alternate host | Verify role before using |
+| oc-dev | `100.114.232.111` | **Currently verified build/test host in this session** | `/root/src/opusclaw/` + `/root/src/opusclaw-ops/` |
+| ccs-8450-xeon | `100.119.185.127` | **User-confirmed active runtime host for opusclaw.me** | Verify SSH/ops wiring before using it as the deploy target |
+| oc-gateway | `100.88.210.12` | Legacy / ops-script-target host still visible in local tooling | Do not assume it is still the authoritative runtime without fresh validation |
 
 **构建与部署**
 
@@ -94,10 +94,11 @@ Deploy scripts (`deploy-opusclaw.sh`, docker-compose configs, CI workflows) have
 
 The standard flow remains:
 1. On the **verified current build host**, build image (tagged `oc-<git-short-hash>` + `local` alias)
-2. If build host and runtime host are separated, transfer/load the image to the **verified current runtime host**
-3. Refresh the `local` alias and recreate the app container via compose
-4. Health-check via `GET /api/status`
-5. Before any production action, confirm the actual target machine again via `deploy-opusclaw.sh status`
+2. Determine the **authoritative runtime host** using public traffic + host verification (domain/API health + SSH/runtime checks), not just old script defaults
+3. If build host and runtime host are separated, transfer/load the image to the verified runtime host
+4. Refresh the `local` alias and recreate the app container via compose
+5. Health-check via `GET /api/status`
+6. Before any production action, confirm the actual target machine again via `deploy-opusclaw.sh status` **and** a direct public health check
 
 **旧 deploy script 引用（保留仅作参考）：**
 
@@ -131,6 +132,8 @@ The standard flow remains:
 ```
 
 **CRITICAL**: Never put source code on the runtime-only host. Never use `docker compose build` on the runtime-only host. The compose file has no `build:` section — it only references `image: opusclaw/new-api:local`.
+
+**Migration note:** at the time of this update, the user confirmed that `opusclaw.me` is already serving from `ccs-8450-xeon`, while local ops commands and SSH aliases may still point to `oc-gateway`. Treat this as a migration-in-progress mismatch that must be reconciled before future deploys.
 
 **本机测试实例**（当前 build host 上的隔离验证环境；本次核验中位于 `oc-dev`）：
 
@@ -168,11 +171,16 @@ docker logs opusclaw-test-app --tail 50
 - `opusclaw-test-app` 使用和生产相同的 `opusclaw/new-api:local` 标签，因此**测试实例验证通过后**再执行正式 `push`。
 - 如果健康检查在 60s 窗口内失败，不代表部署一定失败——先看容器状态、日志和 `/api/status`，尤其留意 Redis 启动时的 `LOADING` 窗口。
 
-**Fact snapshot from this session (2026-04-14 UTC):**
+**Fact snapshot from this session (2026-04-15 UTC):**
 - local machine `hostnamectl` reported `oc-dev`
 - `tailscale status` showed `ccs-8450-xeon` online at `100.119.185.127`
-- `/root/src/opusclaw-ops/deploy-opusclaw.sh status` showed local test instance on this machine and production app running on `oc-gateway`
-- therefore, doc changes must not blindly replace all `oc-dev / oc-gateway` references with `ccs-8450-xeon`; verify first, then act
+- `curl https://opusclaw.me/api/status` returned `success: true`
+- user confirmed `opusclaw.me` is fully running on `ccs-8450-xeon`
+- `/root/src/opusclaw-ops/deploy-opusclaw.sh status` still showed local tooling targeting `oc-gateway`
+- current verified local image tag is `opusclaw/new-api:oc-d60fcb92`
+- current build/test host image tag is `opusclaw/new-api:oc-d60fcb92`
+- SSH access to `ccs-8450-xeon` was not yet usable from this environment because host key verification failed; fix SSH trust/config before using it in deploy automation
+- therefore, do **not** trust old `oc-gateway` defaults blindly, and do **not** trust local-only ops status as the sole source of truth; reconcile public runtime, SSH access, and ops scripts first
 
 **Incident reference**: On 2026-04-04, a stale source code snapshot on the old runtime host (`/srv/opusclaw/app-src/`, on `oc-gateway`) was used to rebuild the container. That snapshot predated the local tiered-billing fork (since removed from this repo during the converge-to-official cleanup), so tiered billing silently fell back to legacy ratio billing for all affected models. The stale directory was renamed to `app-src.deprecated-20260404`. The root cause — keeping any source tree on the runtime host — remains forbidden under the current image-only deployment model.
 
