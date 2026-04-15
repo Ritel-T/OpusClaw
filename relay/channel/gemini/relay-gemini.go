@@ -753,8 +753,7 @@ func cleanFunctionParametersWithDepth(params interface{}, depth int) interface{}
 			}
 		}
 
-		collapseGeminiSchemaCombinators(cleanedMap)
-		normalizeGeminiSchemaTypeAndNullable(cleanedMap)
+		cleanedMap = service.NormalizeSchemaTypes(cleanedMap).(map[string]interface{})
 
 		// Clean properties
 		if props, ok := cleanedMap["properties"].(map[string]interface{}); ok && props != nil {
@@ -799,202 +798,16 @@ func cleanFunctionParametersShallow(params interface{}) interface{} {
 				cleanedMap[k] = val
 			}
 		}
-		collapseGeminiSchemaCombinators(cleanedMap)
-		normalizeGeminiSchemaTypeAndNullable(cleanedMap)
+		cleanedMap = service.NormalizeSchemaTypes(cleanedMap).(map[string]interface{})
 		// Stop recursion and avoid retaining huge nested structures.
 		delete(cleanedMap, "properties")
 		delete(cleanedMap, "items")
-		delete(cleanedMap, "anyOf")
-		delete(cleanedMap, "oneOf")
-		delete(cleanedMap, "allOf")
 		return cleanedMap
 	case []interface{}:
 		// Prefer an empty list over deep recursion on attacker-controlled inputs.
 		return []interface{}{}
 	default:
 		return params
-	}
-}
-
-func normalizeGeminiSchemaTypeAndNullable(schema map[string]interface{}) {
-	rawType, ok := schema["type"]
-	if !ok || rawType == nil {
-		if _, hasProperties := schema["properties"]; hasProperties {
-			schema["type"] = "object"
-			return
-		}
-		if _, hasItems := schema["items"]; hasItems {
-			schema["type"] = "array"
-			return
-		}
-		if _, hasEnum := schema["enum"]; hasEnum {
-			schema["type"] = "string"
-			return
-		}
-		return
-	}
-
-	normalize := func(t string) (string, bool) {
-		switch strings.ToLower(strings.TrimSpace(t)) {
-		case "object":
-			return "object", false
-		case "array":
-			return "array", false
-		case "string":
-			return "string", false
-		case "integer":
-			return "integer", false
-		case "number":
-			return "number", false
-		case "boolean":
-			return "boolean", false
-		case "null":
-			return "", true
-		default:
-			return t, false
-		}
-	}
-
-	switch t := rawType.(type) {
-	case string:
-		normalized, isNull := normalize(t)
-		if isNull {
-			schema["nullable"] = true
-			delete(schema, "type")
-			return
-		}
-		schema["type"] = normalized
-	case []interface{}:
-		nullable := false
-		var chosen string
-		for _, item := range t {
-			if s, ok := item.(string); ok {
-				normalized, isNull := normalize(s)
-				if isNull {
-					nullable = true
-					continue
-				}
-				if chosen == "" {
-					chosen = normalized
-				}
-			}
-		}
-		if nullable {
-			schema["nullable"] = true
-		}
-		if chosen != "" {
-			schema["type"] = chosen
-		} else {
-			delete(schema, "type")
-		}
-	}
-}
-
-func collapseGeminiSchemaCombinators(schema map[string]interface{}) {
-	if schema == nil {
-		return
-	}
-	if _, hasType := schema["type"]; !hasType {
-		if inferredType, nullable := inferTypeFromGeminiSchemaCombinators(schema); inferredType != "" {
-			schema["type"] = inferredType
-			if nullable {
-				schema["nullable"] = true
-			}
-		}
-	}
-	delete(schema, "anyOf")
-	delete(schema, "oneOf")
-	delete(schema, "allOf")
-}
-
-func inferTypeFromGeminiSchemaCombinators(schema map[string]interface{}) (string, bool) {
-	for _, field := range []string{"anyOf", "oneOf", "allOf"} {
-		raw, ok := schema[field]
-		if !ok {
-			continue
-		}
-		variants, ok := raw.([]interface{})
-		if !ok || len(variants) == 0 {
-			continue
-		}
-		nullable := false
-		chosen := ""
-		for _, variant := range variants {
-			variantMap, ok := variant.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			variantType, variantNullable := inferGeminiSchemaType(variantMap)
-			if variantNullable {
-				nullable = true
-			}
-			if variantType != "" {
-				if chosen == "" {
-					chosen = variantType
-				}
-			}
-		}
-		return chosen, nullable
-	}
-	return "", false
-}
-
-func inferGeminiSchemaType(schema map[string]interface{}) (string, bool) {
-	if schema == nil {
-		return "", false
-	}
-	if rawType, ok := schema["type"]; ok && rawType != nil {
-		switch t := rawType.(type) {
-		case string:
-			normalized, isNull := normalizeGeminiSchemaPrimitiveType(t)
-			return normalized, isNull
-		case []interface{}:
-			nullable := false
-			for _, item := range t {
-				if s, ok := item.(string); ok {
-					normalized, isNull := normalizeGeminiSchemaPrimitiveType(s)
-					if isNull {
-						nullable = true
-						continue
-					}
-					if normalized != "" {
-						return normalized, nullable
-					}
-				}
-			}
-			return "", nullable
-		}
-	}
-	if _, hasProperties := schema["properties"]; hasProperties {
-		return "object", false
-	}
-	if _, hasItems := schema["items"]; hasItems {
-		return "array", false
-	}
-	if _, hasEnum := schema["enum"]; hasEnum {
-		return "string", false
-	}
-	return inferTypeFromGeminiSchemaCombinators(schema)
-}
-
-func normalizeGeminiSchemaPrimitiveType(t string) (string, bool) {
-	switch strings.ToLower(strings.TrimSpace(t)) {
-	case "object":
-		return "object", false
-	case "array":
-		return "array", false
-	case "string":
-		return "string", false
-	case "integer":
-		return "integer", false
-	case "number":
-		return "number", false
-	case "boolean":
-		return "boolean", false
-	case "null":
-		return "", true
-	default:
-		return t, false
 	}
 }
 
