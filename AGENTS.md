@@ -247,12 +247,16 @@ Gemini-compatible relay paths are **not** tolerant of loose OpenAI schema/tool a
 **Critical request conversion rules:**
 
 - In `service/convert.go`, Gemini `functionCall` / `functionResponse` pairs MUST preserve a stable OpenAI `tool_call_id` mapping. Do not regenerate tool response IDs independently.
+- If `dto.GeminiFunctionResponse.ID` is present, prefer it when correlating Gemini tool responses back to OpenAI `tool_call_id`; fall back to name-based matching only as a compatibility fallback.
+- Gemini-originated OpenAI `tool` messages should carry `Name` whenever it is available from `functionResponse.Name`, so downstream Responses conversion does not emit empty `function_call_output.name`.
 - In `service/openaicompat/chat_to_responses.go`, `function_call_output` items MUST include `name` as well as `call_id` and `output`.
+- Never emit an empty `function_call_output.name`; use a non-empty fallback only if explicit/backfilled tool names are unavailable.
 - Gemini `fileData` / `inlineData` MUST NOT be blindly converted to OpenAI `image_url`.
   - `image/*` → `image_url`
   - `audio/*` → `input_audio`
   - `video/*` → `video_url`
   - non-image files (e.g. PDF/text) → safe text/file representation, not fake image payloads
+- For `inlineData` labeled `image/*`, validate the decoded bytes before forwarding as `image_url`; obviously invalid image payloads should degrade to file/text handling instead of surfacing opaque upstream image-validation 400s.
 
 **Critical Gemini function schema rules:**
 
@@ -268,9 +272,12 @@ Gemini-compatible relay paths are **not** tolerant of loose OpenAI schema/tool a
 **Known error signatures this rule is meant to prevent:**
 
 - `No tool call found for function call output with call_id ...`
+- `No tool output found for function call ...`
 - `Missing required parameter: 'input[...].name'`
+- `Invalid 'input[...].name': empty string`
 - `Invalid schema for function '...': 'STRING' is not valid ...`
 - `schema didn't specify the schema type field`
+- `The image data you provided does not represent a valid image`
 
 **Required regression tests when touching these paths:**
 
