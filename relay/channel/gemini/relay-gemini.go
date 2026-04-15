@@ -439,6 +439,7 @@ func CovertOpenAI2Gemini(c *gin.Context, textRequest dto.GeneralOpenAIRequest, i
 			var jsonSchema dto.FormatJsonSchema
 			if err := common.Unmarshal(textRequest.ResponseFormat.JsonSchema, &jsonSchema); err == nil {
 				cleanedSchema := removeAdditionalPropertiesWithDepth(jsonSchema.Schema, 0)
+				cleanedSchema = service.NormalizeSchemaTypes(cleanedSchema)
 				geminiRequest.GenerationConfig.ResponseSchema = cleanedSchema
 			}
 		}
@@ -462,6 +463,10 @@ func CovertOpenAI2Gemini(c *gin.Context, textRequest dto.GeneralOpenAIRequest, i
 				name = *message.Name
 			} else if val, exists := tool_call_ids[message.ToolCallId]; exists {
 				name = val
+			}
+			name = strings.TrimSpace(name)
+			if name == "" {
+				return nil, fmt.Errorf("missing function response name for tool_call_id %s", strings.TrimSpace(message.ToolCallId))
 			}
 			var contentMap map[string]interface{}
 			contentStr := message.StringContent()

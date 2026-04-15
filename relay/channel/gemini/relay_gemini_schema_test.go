@@ -3,6 +3,11 @@ package gemini
 import (
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/gin-gonic/gin"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -113,4 +118,63 @@ func TestCleanFunctionParametersCollapsesAnyOfToStableType(t *testing.T) {
 	require.Equal(t, "integer", countSchema["type"])
 	_, hasOneOf := countSchema["oneOf"]
 	require.False(t, hasOneOf)
+}
+
+func TestCovertOpenAI2GeminiNormalizesResponseSchemaTypes(t *testing.T) {
+	t.Parallel()
+
+	schema, err := common.Marshal(dto.FormatJsonSchema{
+		Name: "browser_action",
+		Schema: map[string]any{
+			"type": "OBJECT",
+			"properties": map[string]any{
+				"selector": map[string]any{"type": "STRING"},
+				"delay":    map[string]any{"type": []any{"NUMBER", "null"}},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	req := dto.GeneralOpenAIRequest{
+		Model: "gemini-3.1-pro",
+		ResponseFormat: &dto.ResponseFormat{
+			Type:       "json_schema",
+			JsonSchema: schema,
+		},
+	}
+
+	gCtx, _ := gin.CreateTestContext(nil)
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gemini-3.1-pro"}}
+
+	geminiReq, err := CovertOpenAI2Gemini(gCtx, req, info)
+	require.NoError(t, err)
+
+	responseSchema, ok := geminiReq.GenerationConfig.ResponseSchema.(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "object", responseSchema["type"])
+	properties := responseSchema["properties"].(map[string]any)
+	require.Equal(t, "string", properties["selector"].(map[string]any)["type"])
+	delaySchema := properties["delay"].(map[string]any)
+	require.Equal(t, "number", delaySchema["type"])
+	require.Equal(t, true, delaySchema["nullable"])
+}
+
+func TestCovertOpenAI2GeminiRejectsUnnamedToolResponses(t *testing.T) {
+	t.Parallel()
+
+	req := dto.GeneralOpenAIRequest{
+		Model: "gemini-3.1-pro",
+		Messages: []dto.Message{{
+			Role:       "tool",
+			ToolCallId: "fc-missing",
+			Content:    `{"ok":true}`,
+		}},
+	}
+
+	gCtx, _ := gin.CreateTestContext(nil)
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gemini-3.1-pro"}}
+
+	_, err := CovertOpenAI2Gemini(gCtx, req, info)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "missing function response name")
 }
