@@ -232,3 +232,66 @@ func TestGeminiToOpenAIRequestRejectsInvalidInlineImageBytes(t *testing.T) {
 	require.NotNil(t, parts[0].GetFile())
 	require.Nil(t, parts[0].GetImageMedia())
 }
+
+func TestGeminiToOpenAIRequestPreservesAssistantTextWithToolCalls(t *testing.T) {
+	t.Parallel()
+
+	request := &dto.GeminiChatRequest{
+		Contents: []dto.GeminiChatContent{{
+			Role: "model",
+			Parts: []dto.GeminiPart{
+				{Text: "I'll click the button."},
+				{FunctionCall: &dto.FunctionCall{FunctionName: "browser_click", Arguments: map[string]any{"selector": "#submit"}}},
+			},
+		}},
+	}
+
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-4o-mini"}}
+
+	openaiRequest, err := GeminiToOpenAIRequest(request, info)
+	require.NoError(t, err)
+	require.Len(t, openaiRequest.Messages, 1)
+
+	message := openaiRequest.Messages[0]
+	require.Len(t, message.ParseToolCalls(), 1)
+	parts := message.ParseContent()
+	require.Len(t, parts, 1)
+	require.Equal(t, dto.ContentTypeText, parts[0].Type)
+	require.Equal(t, "I'll click the button.", parts[0].Text)
+}
+
+func TestGeminiToOpenAIRequestMatchesFunctionResponseIDsToAssistantToolCalls(t *testing.T) {
+	t.Parallel()
+
+	request := &dto.GeminiChatRequest{
+		Contents: []dto.GeminiChatContent{
+			{
+				Role: "model",
+				Parts: []dto.GeminiPart{{
+					FunctionCall: &dto.FunctionCall{FunctionName: "read", Arguments: map[string]any{"path": "/tmp/demo.txt"}, ID: []byte(`"fc1"`)},
+				}},
+			},
+			{
+				Role: "function",
+				Parts: []dto.GeminiPart{{
+					FunctionResponse: &dto.GeminiFunctionResponse{
+						Name:     "read",
+						ID:       []byte(`"fc1"`),
+						Response: map[string]any{"content": "hello"},
+					},
+				}},
+			},
+		},
+	}
+
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-4o-mini"}}
+
+	openaiRequest, err := GeminiToOpenAIRequest(request, info)
+	require.NoError(t, err)
+	require.Len(t, openaiRequest.Messages, 2)
+
+	assistantToolCalls := openaiRequest.Messages[0].ParseToolCalls()
+	require.Len(t, assistantToolCalls, 1)
+	require.Equal(t, "fc1", assistantToolCalls[0].ID)
+	require.Equal(t, "fc1", openaiRequest.Messages[1].ToolCallId)
+}

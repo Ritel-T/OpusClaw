@@ -666,7 +666,6 @@ func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycomm
 	var messages []dto.Message
 	toolCallCounter := 0
 	pendingToolCallIDsByName := make(map[string][]string)
-	pendingToolCallIDsByResponseID := make(map[string]string)
 	for _, content := range geminiRequest.Contents {
 		message := dto.Message{
 			Role: convertGeminiRoleToOpenAI(content.Role),
@@ -688,8 +687,11 @@ func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycomm
 				mediaContents = append(mediaContents, convertGeminiFileDataToOpenAIMedia(part.FileData))
 			} else if part.FunctionCall != nil {
 				// 处理 Gemini 的工具调用
-				toolCallCounter++
-				toolCallID := fmt.Sprintf("call_%d", toolCallCounter)
+				toolCallID, resolvedFromResponseID := resolveGeminiFunctionCallID(part.FunctionCall)
+				if !resolvedFromResponseID {
+					toolCallCounter++
+					toolCallID = fmt.Sprintf("call_%d", toolCallCounter)
+				}
 				toolCall := dto.ToolCallRequest{
 					ID:   toolCallID,
 					Type: "function",
@@ -700,12 +702,10 @@ func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycomm
 				}
 				toolCalls = append(toolCalls, toolCall)
 				pendingToolCallIDsByName[part.FunctionCall.FunctionName] = append(pendingToolCallIDsByName[part.FunctionCall.FunctionName], toolCallID)
-				pendingToolCallIDsByResponseID[fmt.Sprintf("call_%d", toolCallCounter-1)] = toolCallID
 			} else if part.FunctionResponse != nil {
-				toolCallID, ok := resolveGeminiFunctionResponseToolCallID(part.FunctionResponse, pendingToolCallIDsByResponseID, pendingToolCallIDsByName)
+				toolCallID, ok := resolveGeminiFunctionResponseToolCallID(part.FunctionResponse, pendingToolCallIDsByName)
 				if !ok {
-					toolCallCounter++
-					toolCallID = fmt.Sprintf("call_%d", toolCallCounter)
+					continue
 				}
 				toolMessage := dto.Message{
 					Role:       "tool",
@@ -721,9 +721,9 @@ func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycomm
 
 		// 设置消息内容
 		if len(toolCalls) > 0 {
-			// 如果有工具调用，设置工具调用
 			message.SetToolCalls(toolCalls)
-		} else if len(mediaContents) == 1 && mediaContents[0].Type == "text" {
+		}
+		if len(mediaContents) == 1 && mediaContents[0].Type == "text" {
 			// 如果只有一个文本内容，直接设置字符串
 			message.Content = mediaContents[0].Text
 		} else if len(mediaContents) > 0 {
@@ -830,15 +830,18 @@ func popPendingToolCallIDByName(pending map[string][]string, name string) (strin
 	return toolCallID, true
 }
 
-func resolveGeminiFunctionResponseToolCallID(functionResponse *dto.GeminiFunctionResponse, pendingByResponseID map[string]string, pendingByName map[string][]string) (string, bool) {
+func resolveGeminiFunctionCallID(functionCall *dto.FunctionCall) (string, bool) {
+	if functionCall == nil {
+		return "", false
+	}
+	return geminiFunctionResponseIDString(functionCall.ID)
+}
+
+func resolveGeminiFunctionResponseToolCallID(functionResponse *dto.GeminiFunctionResponse, pendingByName map[string][]string) (string, bool) {
 	if functionResponse == nil {
 		return "", false
 	}
 	if responseID, ok := geminiFunctionResponseIDString(functionResponse.ID); ok {
-		if toolCallID, found := pendingByResponseID[responseID]; found {
-			delete(pendingByResponseID, responseID)
-			return toolCallID, true
-		}
 		return responseID, true
 	}
 	return popPendingToolCallIDByName(pendingByName, functionResponse.Name)
