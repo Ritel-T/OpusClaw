@@ -103,6 +103,9 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 			if name == "" && callID != "" {
 				name = strings.TrimSpace(toolCallNamesByID[callID])
 			}
+			if name == "" {
+				name = "unknown_function"
+			}
 
 			var output any
 			if msg.Content == nil {

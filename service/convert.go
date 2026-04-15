@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -665,6 +666,7 @@ func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycomm
 	var messages []dto.Message
 	toolCallCounter := 0
 	pendingToolCallIDsByName := make(map[string][]string)
+	pendingToolCallIDsByResponseID := make(map[string]string)
 	for _, content := range geminiRequest.Contents {
 		message := dto.Message{
 			Role: convertGeminiRoleToOpenAI(content.Role),
@@ -698,22 +700,22 @@ func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycomm
 				}
 				toolCalls = append(toolCalls, toolCall)
 				pendingToolCallIDsByName[part.FunctionCall.FunctionName] = append(pendingToolCallIDsByName[part.FunctionCall.FunctionName], toolCallID)
+				pendingToolCallIDsByResponseID[fmt.Sprintf("call_%d", toolCallCounter-1)] = toolCallID
 			} else if part.FunctionResponse != nil {
-				toolCallID, ok := popPendingToolCallIDByName(pendingToolCallIDsByName, part.FunctionResponse.Name)
-				if ok {
-					// 处理 Gemini 的工具响应，创建单独的 tool 消息
-					toolMessage := dto.Message{
-						Role:       "tool",
-						ToolCallId: toolCallID,
-					}
-					toolMessage.SetStringContent(toJSONString(part.FunctionResponse.Response))
-					messages = append(messages, toolMessage)
-				} else {
-					mediaContents = append(mediaContents, dto.MediaContent{
-						Type: "text",
-						Text: formatGeminiFunctionResponseAsText(part.FunctionResponse),
-					})
+				toolCallID, ok := resolveGeminiFunctionResponseToolCallID(part.FunctionResponse, pendingToolCallIDsByResponseID, pendingToolCallIDsByName)
+				if !ok {
+					toolCallCounter++
+					toolCallID = fmt.Sprintf("call_%d", toolCallCounter)
 				}
+				toolMessage := dto.Message{
+					Role:       "tool",
+					ToolCallId: toolCallID,
+				}
+				if name := strings.TrimSpace(part.FunctionResponse.Name); name != "" {
+					toolMessage.Name = &name
+				}
+				toolMessage.SetStringContent(toJSONString(part.FunctionResponse.Response))
+				messages = append(messages, toolMessage)
 			}
 		}
 
@@ -773,7 +775,7 @@ func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycomm
 						Function: dto.FunctionRequest{
 							Name:        function.Name,
 							Description: function.Description,
-							Parameters:  function.Parameters,
+							Parameters:  NormalizeSchemaTypes(function.Parameters),
 						},
 					}
 					tools = append(tools, openAITool)
@@ -828,10 +830,69 @@ func popPendingToolCallIDByName(pending map[string][]string, name string) (strin
 	return toolCallID, true
 }
 
+func resolveGeminiFunctionResponseToolCallID(functionResponse *dto.GeminiFunctionResponse, pendingByResponseID map[string]string, pendingByName map[string][]string) (string, bool) {
+	if functionResponse == nil {
+		return "", false
+	}
+	if responseID, ok := geminiFunctionResponseIDString(functionResponse.ID); ok {
+		if toolCallID, found := pendingByResponseID[responseID]; found {
+			delete(pendingByResponseID, responseID)
+			return toolCallID, true
+		}
+		return responseID, true
+	}
+	return popPendingToolCallIDByName(pendingByName, functionResponse.Name)
+}
+
+func geminiFunctionResponseIDString(raw json.RawMessage) (string, bool) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return "", false
+	}
+	var id string
+	if err := common.Unmarshal(raw, &id); err == nil {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			return id, true
+		}
+	}
+	trimmed = strings.Trim(trimmed, `"`)
+	if trimmed == "" {
+		return "", false
+	}
+	return trimmed, true
+}
+
+func isLikelyValidImageBase64(data string, mimeType string) bool {
+	if !strings.HasPrefix(strings.TrimSpace(mimeType), "image/") {
+		return false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(data)
+	if err != nil || len(decoded) < 4 {
+		return false
+	}
+	if len(decoded) >= 3 && decoded[0] == 0xFF && decoded[1] == 0xD8 && decoded[2] == 0xFF {
+		return true
+	}
+	if len(decoded) >= 8 && decoded[0] == 0x89 && decoded[1] == 0x50 && decoded[2] == 0x4E && decoded[3] == 0x47 && decoded[4] == 0x0D && decoded[5] == 0x0A && decoded[6] == 0x1A && decoded[7] == 0x0A {
+		return true
+	}
+	if len(decoded) >= 6 {
+		header := string(decoded[:6])
+		if header == "GIF87a" || header == "GIF89a" {
+			return true
+		}
+	}
+	if len(decoded) >= 12 && string(decoded[:4]) == "RIFF" && string(decoded[8:12]) == "WEBP" {
+		return true
+	}
+	return false
+}
+
 func convertGeminiInlineDataToOpenAIMedia(inlineData *dto.GeminiInlineData) dto.MediaContent {
 	dataURL := fmt.Sprintf("data:%s;base64,%s", inlineData.MimeType, inlineData.Data)
 	switch {
-	case strings.HasPrefix(inlineData.MimeType, "image/"):
+	case strings.HasPrefix(inlineData.MimeType, "image/") && isLikelyValidImageBase64(inlineData.Data, inlineData.MimeType):
 		return dto.MediaContent{
 			Type: dto.ContentTypeImageURL,
 			ImageUrl: &dto.MessageImageUrl{
@@ -868,6 +929,19 @@ func convertGeminiInlineDataToOpenAIMedia(inlineData *dto.GeminiInlineData) dto.
 func convertGeminiFileDataToOpenAIMedia(fileData *dto.GeminiFileData) dto.MediaContent {
 	uri := strings.TrimSpace(fileData.FileUri)
 	switch {
+	case strings.HasPrefix(fileData.MimeType, "image/") && strings.HasPrefix(uri, "data:"):
+		commaIndex := strings.Index(uri, ",")
+		if commaIndex > 0 && isLikelyValidImageBase64(uri[commaIndex+1:], fileData.MimeType) {
+			return dto.MediaContent{
+				Type: dto.ContentTypeImageURL,
+				ImageUrl: &dto.MessageImageUrl{
+					Url:      uri,
+					Detail:   "auto",
+					MimeType: fileData.MimeType,
+				},
+			}
+		}
+		fallthrough
 	case strings.HasPrefix(fileData.MimeType, "image/"):
 		return dto.MediaContent{
 			Type: dto.ContentTypeImageURL,

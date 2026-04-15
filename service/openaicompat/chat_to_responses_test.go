@@ -94,3 +94,29 @@ func TestChatCompletionsRequestToResponsesRequestPrefersExplicitToolName(t *test
 	require.NotNil(t, toolOutput)
 	require.Equal(t, "lookup_weather", toolOutput["name"])
 }
+
+func TestChatCompletionsRequestToResponsesRequestFallsBackToUnknownFunctionName(t *testing.T) {
+	t.Parallel()
+
+	req := &dto.GeneralOpenAIRequest{
+		Model: "gpt-4.1",
+		Messages: []dto.Message{
+			{
+				Role:       "tool",
+				ToolCallId: "fc-missing",
+				Content:    `{"ok":true}`,
+			},
+		},
+	}
+
+	responsesReq, err := ChatCompletionsRequestToResponsesRequest(req)
+	require.NoError(t, err)
+
+	var items []map[string]any
+	err = common.Unmarshal(responsesReq.Input, &items)
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+	require.Equal(t, "function_call_output", items[0]["type"])
+	require.Equal(t, "fc-missing", items[0]["call_id"])
+	require.Equal(t, "unknown_function", items[0]["name"])
+}
