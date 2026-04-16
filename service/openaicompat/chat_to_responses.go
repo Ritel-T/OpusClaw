@@ -4,12 +4,253 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/samber/lo"
 )
+
+type pendingToolOutput struct {
+	callID string
+	name   string
+	output any
+	index  int
+}
+
+type pendingFunctionCall struct {
+	callID    string
+	name      string
+	arguments any
+	index     int
+}
+
+func normalizeResponsesSchemaTypes(params any) any {
+	return normalizeResponsesSchemaTypesWithDepth(params, 0, 64)
+}
+
+func normalizeResponsesSchemaTypesWithDepth(params any, depth int, maxDepth int) any {
+	if params == nil {
+		return nil
+	}
+	if depth >= maxDepth {
+		return normalizeResponsesSchemaTypesShallow(params)
+	}
+
+	switch v := params.(type) {
+	case map[string]any:
+		cleaned := make(map[string]any, len(v))
+		for key, value := range v {
+			cleaned[key] = value
+		}
+		collapseResponsesSchemaCombinators(cleaned)
+		normalizeResponsesSchemaTypeAndNullable(cleaned)
+		if props, ok := cleaned["properties"].(map[string]any); ok && props != nil {
+			cleanedProps := make(map[string]any, len(props))
+			for key, value := range props {
+				cleanedProps[key] = normalizeResponsesSchemaTypesWithDepth(value, depth+1, maxDepth)
+			}
+			cleaned["properties"] = cleanedProps
+		}
+		if items, ok := cleaned["items"].(map[string]any); ok && items != nil {
+			cleaned["items"] = normalizeResponsesSchemaTypesWithDepth(items, depth+1, maxDepth)
+		}
+		if itemsArray, ok := cleaned["items"].([]any); ok && len(itemsArray) > 0 {
+			cleaned["items"] = normalizeResponsesSchemaTypesWithDepth(itemsArray[0], depth+1, maxDepth)
+		}
+		return cleaned
+	case []any:
+		cleaned := make([]any, len(v))
+		for i, item := range v {
+			cleaned[i] = normalizeResponsesSchemaTypesWithDepth(item, depth+1, maxDepth)
+		}
+		return cleaned
+	default:
+		return params
+	}
+}
+
+func normalizeResponsesSchemaTypesShallow(params any) any {
+	switch v := params.(type) {
+	case map[string]any:
+		cleaned := make(map[string]any, len(v))
+		for key, value := range v {
+			cleaned[key] = value
+		}
+		collapseResponsesSchemaCombinators(cleaned)
+		normalizeResponsesSchemaTypeAndNullable(cleaned)
+		delete(cleaned, "properties")
+		delete(cleaned, "items")
+		delete(cleaned, "anyOf")
+		delete(cleaned, "oneOf")
+		delete(cleaned, "allOf")
+		return cleaned
+	case []any:
+		return []any{}
+	default:
+		return params
+	}
+}
+
+func collapseResponsesSchemaCombinators(schema map[string]any) {
+	if schema == nil {
+		return
+	}
+	if _, hasType := schema["type"]; !hasType {
+		if inferredType, nullable := inferResponsesSchemaTypeFromCombinators(schema); inferredType != "" {
+			schema["type"] = inferredType
+			if nullable {
+				schema["nullable"] = true
+			}
+		}
+	}
+	delete(schema, "anyOf")
+	delete(schema, "oneOf")
+	delete(schema, "allOf")
+}
+
+func normalizeResponsesSchemaTypeAndNullable(schema map[string]any) {
+	rawType, ok := schema["type"]
+	if !ok || rawType == nil {
+		if _, hasProperties := schema["properties"]; hasProperties {
+			schema["type"] = "object"
+			return
+		}
+		if _, hasItems := schema["items"]; hasItems {
+			schema["type"] = "array"
+			return
+		}
+		if _, hasEnum := schema["enum"]; hasEnum {
+			schema["type"] = "string"
+			return
+		}
+		return
+	}
+
+	switch t := rawType.(type) {
+	case string:
+		normalized, isNull := normalizeResponsesSchemaPrimitiveType(t)
+		if isNull {
+			schema["nullable"] = true
+			delete(schema, "type")
+			return
+		}
+		schema["type"] = normalized
+	case []any:
+		nullable := false
+		var chosen string
+		for _, item := range t {
+			if s, ok := item.(string); ok {
+				normalized, isNull := normalizeResponsesSchemaPrimitiveType(s)
+				if isNull {
+					nullable = true
+					continue
+				}
+				if chosen == "" {
+					chosen = normalized
+				}
+			}
+		}
+		if nullable {
+			schema["nullable"] = true
+		}
+		if chosen != "" {
+			schema["type"] = chosen
+		} else {
+			delete(schema, "type")
+		}
+	}
+}
+
+func inferResponsesSchemaTypeFromCombinators(schema map[string]any) (string, bool) {
+	for _, field := range []string{"anyOf", "oneOf", "allOf"} {
+		raw, ok := schema[field]
+		if !ok {
+			continue
+		}
+		variants, ok := raw.([]any)
+		if !ok || len(variants) == 0 {
+			continue
+		}
+		nullable := false
+		chosen := ""
+		for _, variant := range variants {
+			variantMap, ok := variant.(map[string]any)
+			if !ok {
+				continue
+			}
+			variantType, variantNullable := inferResponsesSchemaType(variantMap)
+			if variantNullable {
+				nullable = true
+			}
+			if variantType != "" && chosen == "" {
+				chosen = variantType
+			}
+		}
+		return chosen, nullable
+	}
+	return "", false
+}
+
+func inferResponsesSchemaType(schema map[string]any) (string, bool) {
+	if schema == nil {
+		return "", false
+	}
+	if rawType, ok := schema["type"]; ok && rawType != nil {
+		switch t := rawType.(type) {
+		case string:
+			normalized, isNull := normalizeResponsesSchemaPrimitiveType(t)
+			return normalized, isNull
+		case []any:
+			nullable := false
+			for _, item := range t {
+				if s, ok := item.(string); ok {
+					normalized, isNull := normalizeResponsesSchemaPrimitiveType(s)
+					if isNull {
+						nullable = true
+						continue
+					}
+					if normalized != "" {
+						return normalized, nullable
+					}
+				}
+			}
+			return "", nullable
+		}
+	}
+	if _, hasProperties := schema["properties"]; hasProperties {
+		return "object", false
+	}
+	if _, hasItems := schema["items"]; hasItems {
+		return "array", false
+	}
+	if _, hasEnum := schema["enum"]; hasEnum {
+		return "string", false
+	}
+	return inferResponsesSchemaTypeFromCombinators(schema)
+}
+
+func normalizeResponsesSchemaPrimitiveType(t string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(t)) {
+	case "object":
+		return "object", false
+	case "array":
+		return "array", false
+	case "string":
+		return "string", false
+	case "integer":
+		return "integer", false
+	case "number":
+		return "number", false
+	case "boolean":
+		return "boolean", false
+	case "null":
+		return "", true
+	default:
+		return t, false
+	}
+}
 
 func normalizeChatImageURLToString(v any) any {
 	switch vv := v.(type) {
@@ -87,6 +328,10 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 	var instructionsParts []string
 	inputItems := make([]map[string]any, 0, len(req.Messages))
 	toolCallNamesByID := make(map[string]string)
+	pendingToolOutputs := make([]pendingToolOutput, 0)
+	pendingFunctionCalls := make([]pendingFunctionCall, 0)
+	functionCallIndex := 0
+	toolOutputIndex := 0
 
 	for _, msg := range req.Messages {
 		role := strings.TrimSpace(msg.Role)
@@ -99,12 +344,6 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 			name := ""
 			if msg.Name != nil {
 				name = strings.TrimSpace(*msg.Name)
-			}
-			if name == "" && callID != "" {
-				name = strings.TrimSpace(toolCallNamesByID[callID])
-			}
-			if name == "" {
-				name = "unknown_function"
 			}
 
 			var output any
@@ -128,12 +367,13 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 				continue
 			}
 
-			inputItems = append(inputItems, map[string]any{
-				"type":    "function_call_output",
-				"call_id": callID,
-				"name":    name,
-				"output":  output,
+			pendingToolOutputs = append(pendingToolOutputs, pendingToolOutput{
+				callID: callID,
+				name:   name,
+				output: output,
+				index:  toolOutputIndex,
 			})
+			toolOutputIndex++
 			continue
 		}
 
@@ -185,12 +425,13 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 						continue
 					}
 					toolCallNamesByID[tc.ID] = name
-					inputItems = append(inputItems, map[string]any{
-						"type":      "function_call",
-						"call_id":   tc.ID,
-						"name":      name,
-						"arguments": tc.Function.Arguments,
+					pendingFunctionCalls = append(pendingFunctionCalls, pendingFunctionCall{
+						callID:    tc.ID,
+						name:      name,
+						arguments: tc.Function.Arguments,
+						index:     functionCallIndex,
 					})
+					functionCallIndex++
 				}
 			}
 			continue
@@ -213,12 +454,13 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 						continue
 					}
 					toolCallNamesByID[tc.ID] = name
-					inputItems = append(inputItems, map[string]any{
-						"type":      "function_call",
-						"call_id":   tc.ID,
-						"name":      name,
-						"arguments": tc.Function.Arguments,
+					pendingFunctionCalls = append(pendingFunctionCalls, pendingFunctionCall{
+						callID:    tc.ID,
+						name:      name,
+						arguments: tc.Function.Arguments,
+						index:     functionCallIndex,
 					})
+					functionCallIndex++
 				}
 			}
 			continue
@@ -279,13 +521,68 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 					continue
 				}
 				toolCallNamesByID[tc.ID] = name
-				inputItems = append(inputItems, map[string]any{
-					"type":      "function_call",
-					"call_id":   tc.ID,
-					"name":      name,
-					"arguments": tc.Function.Arguments,
+				pendingFunctionCalls = append(pendingFunctionCalls, pendingFunctionCall{
+					callID:    tc.ID,
+					name:      name,
+					arguments: tc.Function.Arguments,
+					index:     functionCallIndex,
 				})
+				functionCallIndex++
 			}
+		}
+	}
+
+	sort.SliceStable(pendingFunctionCalls, func(i, j int) bool {
+		return pendingFunctionCalls[i].index < pendingFunctionCalls[j].index
+	})
+	sort.SliceStable(pendingToolOutputs, func(i, j int) bool {
+		return pendingToolOutputs[i].index < pendingToolOutputs[j].index
+	})
+
+	remainingOutputsByID := make(map[string][]pendingToolOutput)
+	for _, output := range pendingToolOutputs {
+		mappedName := strings.TrimSpace(toolCallNamesByID[output.callID])
+		if output.name == "" && mappedName != "" {
+			output.name = mappedName
+		}
+		if output.name == "" {
+			output.name = "unknown_function"
+		}
+		remainingOutputsByID[output.callID] = append(remainingOutputsByID[output.callID], output)
+	}
+
+	for _, call := range pendingFunctionCalls {
+		inputItems = append(inputItems, map[string]any{
+			"type":      "function_call",
+			"call_id":   call.callID,
+			"name":      call.name,
+			"arguments": call.arguments,
+		})
+		outputs := remainingOutputsByID[call.callID]
+		for _, output := range outputs {
+			inputItems = append(inputItems, map[string]any{
+				"type":    "function_call_output",
+				"call_id": output.callID,
+				"name":    output.name,
+				"output":  output.output,
+			})
+		}
+		delete(remainingOutputsByID, call.callID)
+	}
+
+	remainingCallIDs := make([]string, 0, len(remainingOutputsByID))
+	for callID := range remainingOutputsByID {
+		remainingCallIDs = append(remainingCallIDs, callID)
+	}
+	sort.Strings(remainingCallIDs)
+	for _, callID := range remainingCallIDs {
+		for _, output := range remainingOutputsByID[callID] {
+			inputItems = append(inputItems, map[string]any{
+				"type":    "function_call_output",
+				"call_id": output.callID,
+				"name":    output.name,
+				"output":  output.output,
+			})
 		}
 	}
 
@@ -310,7 +607,7 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 					"type":        "function",
 					"name":        tool.Function.Name,
 					"description": tool.Function.Description,
-					"parameters":  tool.Function.Parameters,
+					"parameters":  normalizeResponsesSchemaTypes(tool.Function.Parameters),
 				})
 			default:
 				// Best-effort: keep original tool shape for unknown types.
