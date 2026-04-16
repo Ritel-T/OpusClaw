@@ -80,7 +80,7 @@ bun run build
 
 ## Deployment
 
-**当前部署状态存在“公网实际运行”与“本地 ops/SSH 认知”可能短暂不一致的情况。必须同时核验：`hostnamectl`、`tailscale status`、`/root/src/opusclaw-ops/deploy-opusclaw.sh status`、以及 `https://opusclaw.me/api/status`。不要仅根据旧主机名、旧脚本默认值或单一探测结果做判断。**
+**当前部署状态存在“公网实际运行”与“本地 ops/SSH 认知”可能短暂不一致的情况。必须同时核验：`hostnamectl`、`tailscale status`、`/root/src/opusclaw-ops/deploy-opusclaw.sh status`、以及 `https://opusclaw.me/api/status`。不要仅根据旧主机名、旧脚本默认值或单一探测结果做判断。服务健康（`/api/status` 返回 success）并不等于部署正确——还必须核验运行中的容器镜像、镜像 labels（commit/branch/built-at）以及 compose 文件引用的 image。**
 
 | Machine | Tailscale | Role | Source Code |
 |---------|-----------|------|-------------|
@@ -96,9 +96,11 @@ The standard flow remains:
 1. On the **verified current build host**, build image (tagged `oc-<git-short-hash>` + `local` alias)
 2. Determine the **authoritative runtime host** using public traffic + host verification (domain/API health + SSH/runtime checks), not just old script defaults
 3. If build host and runtime host are separated, transfer/load the image to the verified runtime host
-4. Refresh the `local` alias and recreate the app container via compose
+4. Refresh the `local` alias and recreate the app container via compose with `--force-recreate`
 5. Health-check via `GET /api/status`
-6. Before any production action, confirm the actual target machine again via `deploy-opusclaw.sh status` **and** a direct public health check
+6. Verify the **running** container actually references `opusclaw/new-api:local` (or the expected image chain), not a stale pinned image such as `calciumion/new-api:v0.12.9`
+7. Verify the running container labels (`opusclaw.commit`, `opusclaw.branch`, `opusclaw.built-at`) match the image you just built
+8. Before any production action, confirm the actual target machine again via `deploy-opusclaw.sh status` **and** a direct public health check
 
 **旧 deploy script 引用（保留仅作参考）：**
 
@@ -116,9 +118,14 @@ The standard flow remains:
 **部署流程**：
 1. `docker build` on the verified build host from `/root/src/opusclaw/`，打 `oc-<hash>` 不可变标签 + `local` 别名
 2. If build/deploy hosts are separated, `docker save | gzip | ssh <runtime-host> gunzip | docker load` 传输镜像
-3. On the verified runtime host, `docker tag` 建立 `local` 别名 + `docker compose up -d app` 重建容器
+3. On the verified runtime host, `docker tag` 建立 `local` 别名 + `docker compose up -d --force-recreate app` 重建容器
 4. 自动等待并通过 `/api/status` 端点验证健康状态
-5. 旧镜像以不可变标签保留，随时可 `rollback`
+5. **额外核验**：
+   - `docker inspect opusclaw-app --format '{{.Config.Image}}'`
+   - `docker inspect opusclaw-app --format '{{json .Config.Labels}}'`
+   - `docker logs opusclaw-app --since 2m | grep 'New API '`
+   - 确认运行中的镜像与 commit/branch labels 符合预期
+6. 旧镜像以不可变标签保留，随时可 `rollback`
 
 **健康检查端点**：`GET /api/status` — 返回包含 `success` 的 JSON 表示服务正常。compose 中的 healthcheck 也使用此端点。
 
@@ -131,7 +138,9 @@ The standard flow remains:
 └── redis/               ← Redis AOF (persistent)
 ```
 
-**CRITICAL**: Never put source code on the runtime-only host. Never use `docker compose build` on the runtime-only host. The compose file has no `build:` section — it only references `image: opusclaw/new-api:local`.
+**CRITICAL**: Never put source code on the runtime-only host. Never use `docker compose build` on the runtime-only host. The compose file has no `build:` section — it only references `image: opusclaw/new-api:local`. If the runtime compose file still references a stale external image (e.g. `calciumion/new-api:v0.12.9`), deployment is **not** considered complete even if `/api/status` is healthy.
+
+**Version stamping rule**: a healthy deploy must also surface a meaningful running version. Empty `VERSION` files are forbidden for production release builds. Build metadata should resolve to a non-empty version string (preferred order: explicit `VERSION`, otherwise `git describe --tags --always`, otherwise short commit hash) so `/api/status.version` and startup logs identify the actual running build.
 
 **Migration note:** at the time of this update, the user confirmed that `opusclaw.me` is already serving from `ccs-8450-xeon`, while local ops commands and SSH aliases may still point to `oc-gateway`. Treat this as a migration-in-progress mismatch that must be reconciled before future deploys.
 
@@ -181,6 +190,14 @@ docker logs opusclaw-test-app --tail 50
 - current build/test host image tag is `opusclaw/new-api:oc-d60fcb92`
 - SSH access to `ccs-8450-xeon` was not yet usable from this environment because host key verification failed; fix SSH trust/config before using it in deploy automation
 - therefore, do **not** trust old `oc-gateway` defaults blindly, and do **not** trust local-only ops status as the sole source of truth; reconcile public runtime, SSH access, and ops scripts first
+
+**Fact snapshot from this session (2026-04-16 UTC, after deploy drift correction):**
+- `ccs-8450-xeon` originally still ran `calciumion/new-api:v0.12.9` even after new `opusclaw/new-api:local` images were transferred
+- root cause: runtime compose file on `ccs-8450-xeon` still pinned the stale image name instead of `opusclaw/new-api:local`
+- after correcting `/srv/opusclaw/deploy/docker-compose.yml` and force-recreating the app, `docker inspect opusclaw-app` showed `Image=opusclaw/new-api:local`
+- running container labels then matched the expected build provenance: `opusclaw.commit=99141e659`, `opusclaw.branch=main`
+- `/api/status.version` became empty rather than `v0.12.9`, proving the stale binary was gone and exposing a separate version-stamping issue
+- lesson: deployment verification must distinguish **service health** from **artifact correctness**
 
 **Incident reference**: On 2026-04-04, a stale source code snapshot on the old runtime host (`/srv/opusclaw/app-src/`, on `oc-gateway`) was used to rebuild the container. That snapshot predated the local tiered-billing fork (since removed from this repo during the converge-to-official cleanup), so tiered billing silently fell back to legacy ratio billing for all affected models. The stale directory was renamed to `app-src.deprecated-20260404`. The root cause — keeping any source tree on the runtime host — remains forbidden under the current image-only deployment model.
 
