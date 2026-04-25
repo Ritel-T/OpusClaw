@@ -2,6 +2,7 @@ package relay
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -87,6 +88,9 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 
 	resp, err := adaptor.DoRequest(c, info, requestBody)
 	if err != nil {
+		if c.Request != nil && c.Request.Context().Err() != nil {
+			return types.NewOpenAIError(context.Cause(c.Request.Context()), types.ErrorCodeDoRequestFailed, 499, types.ErrOptionWithSkipRetry())
+		}
 		return types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
 	}
 	var httpResp *http.Response
