@@ -159,7 +159,7 @@ func GetAndValidOpenAIImageRequest(c *gin.Context, relayMode int) (*dto.ImageReq
 				imageRequest.Image, _ = json.Marshal(imageValue)
 			}
 
-			if imageRequest.Model == "gpt-image-1" {
+			if common.IsGPTImageModel(imageRequest.Model) {
 				if imageRequest.Quality == "" {
 					imageRequest.Quality = "standard"
 				}
@@ -209,7 +209,7 @@ func GetAndValidOpenAIImageRequest(c *gin.Context, relayMode int) (*dto.ImageReq
 			if imageRequest.Size == "" {
 				imageRequest.Size = "1024x1024"
 			}
-		} else if imageRequest.Model == "gpt-image-1" {
+		} else if common.IsGPTImageModel(imageRequest.Model) {
 			if imageRequest.Quality == "" {
 				imageRequest.Quality = "auto"
 			}
@@ -233,7 +233,7 @@ func GetAndValidateClaudeRequest(c *gin.Context) (textRequest *dto.ClaudeRequest
 	if err != nil {
 		return nil, err
 	}
-	if textRequest.Messages == nil || len(textRequest.Messages) == 0 {
+	if len(textRequest.Messages) == 0 {
 		return nil, errors.New("field messages is required")
 	}
 	if textRequest.Model == "" {
