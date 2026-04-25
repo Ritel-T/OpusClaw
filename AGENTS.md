@@ -411,3 +411,7 @@ We maintain a custom fix that prevents billing users when an upstream stream is 
 3. 如果你的修改与已有未提交修改冲突 → 停下来，告知用户，等待指示
 
 **事故参考**：2026-04-05（Sub2API 项目），一个 agent 看到工作区有 14 个文件的未提交修改，误判为子 agent 的 scope creep，执行 `git checkout` 全部丢弃。实际上其中包含另一个 session 完成的完整功能实现（含测试、部署），导致全部修改不可恢复地丢失，需要完整重新实现。
+
+### Rule 11: Billing Expression System — Read `pkg/billingexpr/expr.md`
+
+When working on tiered/dynamic billing (expression-based pricing), you MUST read `pkg/billingexpr/expr.md` first. It documents the design philosophy, expression language (variables, functions, examples), full system architecture (editor → storage → pre-consume → settlement → log display), token normalization rules (`p`/`c` auto-exclusion), quota conversion, and expression versioning. All code changes to the billing expression system must follow the patterns described in that document.
