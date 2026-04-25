@@ -22,9 +22,12 @@ func CloseResponseBodyGracefully(httpResponse *http.Response) {
 	}
 }
 
-func IOCopyBytesGracefully(c *gin.Context, src *http.Response, data []byte) {
+func IOCopyBytesGracefully(c *gin.Context, src *http.Response, data []byte) error {
 	if c.Writer == nil {
-		return
+		return nil
+	}
+	if c.Request != nil && c.Request.Context().Err() != nil {
+		return fmt.Errorf("request context done before response copy: %w", c.Request.Context().Err())
 	}
 
 	body := io.NopCloser(bytes.NewBuffer(data))
@@ -56,6 +59,8 @@ func IOCopyBytesGracefully(c *gin.Context, src *http.Response, data []byte) {
 	_, err := io.Copy(c.Writer, body)
 	if err != nil {
 		logger.LogError(c, fmt.Sprintf("failed to copy response body: %s", err.Error()))
+		return err
 	}
 	c.Writer.Flush()
+	return nil
 }
