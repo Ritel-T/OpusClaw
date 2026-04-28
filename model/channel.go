@@ -74,7 +74,18 @@ func (c ChannelInfo) Value() (driver.Value, error) {
 
 // Scan implements sql.Scanner interface
 func (c *ChannelInfo) Scan(value interface{}) error {
-	bytesValue, _ := value.([]byte)
+	var bytesValue []byte
+	switch v := value.(type) {
+	case []byte:
+		bytesValue = v
+	case string:
+		bytesValue = []byte(v)
+	default:
+		return nil
+	}
+	if len(bytesValue) == 0 {
+		return nil
+	}
 	return common.Unmarshal(bytesValue, c)
 }
 
