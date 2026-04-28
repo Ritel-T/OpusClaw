@@ -199,6 +199,16 @@ docker logs opusclaw-test-app --tail 50
 - `/api/status.version` became empty rather than `v0.12.9`, proving the stale binary was gone and exposing a separate version-stamping issue
 - lesson: deployment verification must distinguish **service health** from **artifact correctness**
 
+**Fact snapshot from this session (2026-04-28 UTC, upstream v0.13.2 deploy):**
+- current source `main` was merged through `upstream/main` at `9f8a4ec05` (`v0.13.2` plus follow-up pricing-render fix) and then received `f779a7a99 fix(docker): stamp fallback build version`
+- `Dockerfile` now stamps a non-empty runtime version from `VERSION_FALLBACK` when `VERSION` is empty; `/root/src/opusclaw-ops/deploy-opusclaw.sh` was updated locally to pass `--build-arg VERSION_FALLBACK=<short-commit>`
+- note: the ops repo commit failed in this environment because Git author identity is not configured there; commit `deploy-opusclaw.sh` after setting repo/user identity, otherwise future builds may regress to blank `/api/status.version`
+- built image `opusclaw/new-api:oc-f779a7a99` on `oc-dev`; labels: `opusclaw.commit=f779a7a99`, `opusclaw.branch=main`, `opusclaw.built-on=oc-dev`
+- local test instance `opusclaw-test-app` was recreated from `opusclaw/new-api:local`; `http://127.0.0.1:13000/api/status` returned `success: true` and `version: "f779a7a99"`; startup log showed `New API f779a7a99 started`
+- production push transferred `oc-f779a7a99` to `ccs-8450-xeon`, retagged `opusclaw/new-api:local`, and recreated `opusclaw-app`
+- production script health retries initially missed the readiness window, but independent verification passed immediately afterward: `https://opusclaw.me/api/status` returned `success: true` and `version: "f779a7a99"`; `docker inspect opusclaw-app` showed `Image=opusclaw/new-api:local`, healthy container state, and labels matching `f779a7a99/main`
+- observed live relay logs after deployment included normal successful traffic plus user/upstream errors (e.g. quota 403 and Gemini tool-output 400); these were request-level errors on live traffic, not container startup failures
+
 **Incident reference**: On 2026-04-04, a stale source code snapshot on the old runtime host (`/srv/opusclaw/app-src/`, on `oc-gateway`) was used to rebuild the container. That snapshot predated the local tiered-billing fork (since removed from this repo during the converge-to-official cleanup), so tiered billing silently fell back to legacy ratio billing for all affected models. The stale directory was renamed to `app-src.deprecated-20260404`. The root cause — keeping any source tree on the runtime host — remains forbidden under the current image-only deployment model.
 
 ## Rules
