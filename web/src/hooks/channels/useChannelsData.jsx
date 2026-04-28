@@ -347,7 +347,7 @@ export const useChannelsData = () => {
     const typeParam = typeKey !== 'all' ? `&type=${typeKey}` : '';
     const statusParam = statusF !== 'all' ? `&status=${statusF}` : '';
     const res = await API.get(
-      `/api/channel/?p=${page}&page_size=${pageSize}&id_sort=${idSort}&tag_mode=${enableTagMode}${typeParam}${statusParam}`,
+      `/api/channel/?p=${Number.isInteger(page) && page > 0 ? page : 1}&page_size=${pageSize}&id_sort=${idSort}&tag_mode=${enableTagMode}${typeParam}${statusParam}`,
     );
 
     if (res === undefined || reqId !== requestCounter.current) {
@@ -399,7 +399,7 @@ export const useChannelsData = () => {
       const typeParam = typeKey !== 'all' ? `&type=${typeKey}` : '';
       const statusParam = statusF !== 'all' ? `&status=${statusF}` : '';
       const res = await API.get(
-        `/api/channel/search?keyword=${searchKeyword}&group=${searchGroup}&model=${searchModel}&id_sort=${sortFlag}&tag_mode=${enableTagMode}&p=${page}&page_size=${pageSz}${typeParam}${statusParam}`,
+        `/api/channel/search?keyword=${searchKeyword}&group=${searchGroup}&model=${searchModel}&id_sort=${sortFlag}&tag_mode=${enableTagMode}&p=${Number.isInteger(page) && page > 0 ? page : 1}&page_size=${Number.isInteger(pageSz) && pageSz > 0 ? pageSz : pageSize}${typeParam}${statusParam}`,
       );
       const { success, message, data } = res.data;
       if (success) {
@@ -518,16 +518,17 @@ export const useChannelsData = () => {
 
   // Page handlers
   const handlePageChange = (page) => {
+    const normalizedPage = Number.isInteger(page) && page > 0 ? page : 1;
     const { searchKeyword, searchGroup, searchModel } = getFormValues();
-    setActivePage(page);
+    setActivePage(normalizedPage);
     if (searchKeyword === '' && searchGroup === '' && searchModel === '') {
-      loadChannels(page, pageSize, idSort, enableTagMode).then(() => {});
+      loadChannels(normalizedPage, pageSize, idSort, enableTagMode).then(() => {});
     } else {
       searchChannels(
         enableTagMode,
         activeTypeKey,
         statusFilter,
-        page,
+        normalizedPage,
         pageSize,
         idSort,
       );
