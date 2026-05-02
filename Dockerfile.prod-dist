@@ -24,7 +24,9 @@ RUN go mod download
 
 COPY . .
 COPY --from=builder-classic /build/dist ./web/classic/dist
-RUN VERSION_VALUE="$(cat VERSION 2>/dev/null || true)" \
+RUN grep -q "assets-cb20260502edgefix" web/default/dist/index.html \
+    && go clean -cache \
+    && VERSION_VALUE="$(cat VERSION 2>/dev/null || true)" \
     && VERSION_VALUE="${VERSION_VALUE:-${VERSION_FALLBACK}}" \
     && go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=${VERSION_VALUE}'" -o new-api
 
